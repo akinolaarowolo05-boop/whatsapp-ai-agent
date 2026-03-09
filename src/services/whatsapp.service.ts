@@ -5,7 +5,6 @@ import {
   WASocket,
   proto 
 } from '@whiskeysockets/baileys';
-import qrcode from 'qrcode-terminal';
 import { WhatsAppMessage, ConnectionStatus } from '../types';
 import { logger } from '../utils/logger';
 
@@ -35,16 +34,45 @@ export class WhatsAppService {
       this.sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
+        browser: ['Ubuntu', 'Chrome', '20.0.04'], // Required for pairing code
       });
+
+      if (!this.sock.authState.creds.registered) {
+        const readline = require('readline');
+        const rl = readline.createInterface({
+          input: process.stdin,
+          output: process.stdout
+        });
+        
+        rl.question('\n📱 Please enter your WhatsApp phone number (with country code, e.g., 1234567890): ', async (phoneNumber: string) => {
+          try {
+            const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
+            const code = await this.sock?.requestPairingCode(cleanNumber);
+            console.log('\n' + '='.repeat(60));
+            console.log(`🔢 YOUR PAIRING CODE: ${code}`);
+            console.log('To link your device:');
+            console.log('1. Open WhatsApp on your phone');
+            console.log('2. Tap the three dots (Android) or Settings (iPhone)');
+            console.log('3. Tap "Linked devices" -> "Link a device"');
+            console.log('4. Tap "Link with phone number instead"');
+            console.log('5. Enter the pairing code above');
+            console.log('='.repeat(60) + '\n');
+          } catch (error) {
+            logger.error('Failed to request pairing code', { error });
+          }
+          rl.close();
+        });
+      }
 
       // Handle connection updates
       this.sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
+        const { connection, lastDisconnect } = update;
 
-        if (qr) {
-          logger.info('QR Code received, please scan with WhatsApp');
-          qrcode.generate(qr, { small: true });
-        }
+        // QR code is no longer needed since we use pairing code
+        // if (qr) {
+        //   logger.info('QR Code received, please scan with WhatsApp');
+        //   qrcode.generate(qr, { small: true });
+        // }
 
         if (connection === 'close') {
           const shouldReconnect = (lastDisconnect?.error as any)?.output?.statusCode !== DisconnectReason.loggedOut;
