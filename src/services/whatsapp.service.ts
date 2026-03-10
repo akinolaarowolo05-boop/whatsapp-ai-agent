@@ -1,24 +1,76 @@
-import { 
-  default as makeWASocket, 
-  DisconnectReason, 
-  useMultiFileAuthState,
-  WASocket,
-  proto 
-} from '@whiskeysockets/baileys';
-import { WhatsAppMessage, ConnectionStatus } from '../types';
+import { Client, LocalAuth } from 'whatsapp-web.js';
+import { whatsappConfig } from '../config/whatsapp.config';
 import { logger } from '../utils/logger';
+import * as fs from 'fs';
+import * as path from 'path';
 
-/**
- * WhatsApp Service for handling WhatsApp Web connection and messages
- */
 export class WhatsAppService {
-  private sock: WASocket | null = null;
-  private connectionStatus: ConnectionStatus = ConnectionStatus.DISCONNECTED;
-  private messageHandlers: Array<(message: WhatsAppMessage) => void> = [];
-  private statusHandlers: Array<(status: ConnectionStatus) => void> = [];
+  private client: Client;
+  private isConnected: boolean = false;
 
   constructor() {
-    logger.info('WhatsApp Service initialized');
+    // Use LocalAuth for session persistence
+    // This saves session data locally so you don't need to scan QR code every time
+    this.client = new Client({
+      authStrategy: new LocalAuth(),
+      puppeteer: {
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      },
+    });
+
+    this.setupEventListeners();
+  }
+
+  private setupEventListeners(): void {
+    // QR Code event - only fires on first login
+    this.client.on('qr', (qr: string) => {
+      logger.info('QR Code received - Scan this with your WhatsApp mobile app');
+      console.log('\n=== WHATSAPP QR CODE ===');
+      console.log('Please scan the QR code below with your WhatsApp mobile device');
+      console.log('Go to: Settings > Linked Devices > Link a Device');
+      console.log(qr); // Display QR code as text
+      console.log('========================\n');
+    });
+
+    // Authenticated event - fires after successful QR scan
+    this.client.on('authenticated', (session) => {
+      logger.info('WhatsApp authenticated successfully!', {
+        whatsappNumber: whatsappConfig.whatsappNumber,
+      });
+      console.log('✅ Device linked successfully to WhatsApp!');
+    });
+
+    // Ready event - fires when client is fully initialized
+    this.client.on('ready', () => {
+      this.isConnected = true;
+      logger.info('WhatsApp client is ready', {
+        whatsappNumber: whatsappConfig.whatsappNumber,
+      });
+      console.log(`🚀 WhatsApp AI Chatbot ready for number: ${whatsappConfig.whatsappNumber}`);
+    });
+
+    // Disconnected event
+    this.client.on('disconnected', (reason) => {
+      this.isConnected = false;
+      logger.warn('WhatsApp client disconnected', { reason });
+      console.log('❌ WhatsApp disconnected:', reason);
+    });
+
+    // Message received event
+    this.client.on('message', (message) => {
+      logger.info('Message received', {
+        from: message.from,
+        body: message.body,
+      });
+    });
+
+    // Error handling
+    this.client.on('error', (error) => {
+      logger.error('WhatsApp client error', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    });
   }
 
   /**
@@ -26,263 +78,84 @@ export class WhatsAppService {
    */
   async initialize(): Promise<void> {
     try {
-      logger.info('Initializing WhatsApp connection...');
-      this.updateConnectionStatus(ConnectionStatus.CONNECTING);
-
-      const { state, saveCreds } = await useMultiFileAuthState('.whatsapp-session');
-      
-      this.sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: false,
-        browser: ['Ubuntu', 'Chrome', '20.0.04'], // Required for pairing code
+      logger.info('Initializing WhatsApp service', {
+        whatsappNumber: whatsappConfig.whatsappNumber,
       });
 
-      if (!this.sock.authState.creds.registered) {
-        const readline = require('readline');
-        const rl = readline.createInterface({
-          input: process.stdin,
-          output: process.stdout
-        });
-        
-        rl.question('\n📱 Please enter your WhatsApp phone number (with country code, e.g., 1234567890): ', async (phoneNumber: string) => {
-          try {
-            const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
-            const code = await this.sock?.requestPairingCode(cleanNumber);
-            console.log('\n' + '='.repeat(60));
-            console.log(`🔢 YOUR PAIRING CODE: ${code}`);
-            console.log('To link your device:');
-            console.log('1. Open WhatsApp on your phone');
-            console.log('2. Tap the three dots (Android) or Settings (iPhone)');
-            console.log('3. Tap "Linked devices" -> "Link a device"');
-            console.log('4. Tap "Link with phone number instead"');
-            console.log('5. Enter the pairing code above');
-            console.log('='.repeat(60) + '\n');
-          } catch (error) {
-            logger.error('Failed to request pairing code', { error });
-          }
-          rl.close();
-        });
+      // Check if session already exists
+      const sessionExists = await this.checkSessionExists();
+      
+      if (sessionExists) {
+        console.log('✅ Existing session found - resuming connection...');
+        logger.info('Resuming WhatsApp session');
+      } else {
+        console.log('\n📱 First time setup - QR code will appear below');
+        console.log('Please scan the QR code with your WhatsApp mobile device\n');
       }
 
-      // Handle connection updates
-      this.sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
-
-        // QR code is no longer needed since we use pairing code
-        // if (qr) {
-        //   logger.info('QR Code received, please scan with WhatsApp');
-        //   qrcode.generate(qr, { small: true });
-        // }
-
-        if (connection === 'close') {
-          const shouldReconnect = (lastDisconnect?.error as any)?.output?.statusCode !== DisconnectReason.loggedOut;
-          
-          logger.info('Connection closed', { 
-            reason: lastDisconnect?.error, 
-            shouldReconnect 
-          });
-
-          if (shouldReconnect) {
-            this.updateConnectionStatus(ConnectionStatus.CONNECTING);
-            await this.initialize();
-          } else {
-            this.updateConnectionStatus(ConnectionStatus.DISCONNECTED);
-          }
-        } else if (connection === 'open') {
-          logger.info('WhatsApp connection established');
-          this.updateConnectionStatus(ConnectionStatus.READY);
-        }
-      });
-
-      // Handle credentials update
-      this.sock.ev.on('creds.update', saveCreds);
-
-      // Handle messages
-      this.sock.ev.on('messages.upsert', async (m) => {
-        const msg = m.messages[0];
-        
-        if (msg && !msg.key.fromMe && msg.message) {
-          const whatsappMessage = this.parseMessage(msg);
-          if (whatsappMessage) {
-            logger.info('Message received', { 
-              from: whatsappMessage.from, 
-              content: whatsappMessage.content.substring(0, 50) 
-            });
-            
-            // Notify all message handlers
-            this.messageHandlers.forEach(handler => {
-              try {
-                handler(whatsappMessage);
-              } catch (error) {
-                logger.error('Error in message handler', { error: error instanceof Error ? error.message : 'Unknown error' });
-              }
-            });
-          }
-        }
-      });
-
+      // Initialize the client
+      await this.client.initialize();
+      
       logger.info('WhatsApp service initialized successfully');
     } catch (error) {
-      logger.error('Failed to initialize WhatsApp service', { error: error instanceof Error ? error.message : 'Unknown error' });
-      this.updateConnectionStatus(ConnectionStatus.DISCONNECTED);
+      logger.error('Failed to initialize WhatsApp service', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
       throw error;
     }
   }
 
   /**
-   * Send message to a specific chat
+   * Check if a saved session exists
    */
-  async sendMessage(chatId: string, message: string): Promise<boolean> {
-    if (!this.sock || this.connectionStatus !== ConnectionStatus.READY) {
-      logger.error('WhatsApp not connected');
-      return false;
-    }
+  private async checkSessionExists(): Promise<boolean> {
+    const sessionPath = path.join(process.cwd(), '.wwebjs_auth', 'session');
+    return fs.existsSync(sessionPath);
+  }
 
+  /**
+   * Send a message
+   */
+  async sendMessage(chatId: string, message: string): Promise<void> {
     try {
-      await this.sock.sendMessage(chatId, { text: message });
-      logger.info('Message sent successfully', { chatId, messageLength: message.length });
-      return true;
-    } catch (error) {
-      logger.error('Failed to send message', { 
-        chatId, 
-        error: error instanceof Error ? error.message : 'Unknown error' 
-      });
-      return false;
-    }
-  }
-
-  /**
-   * Parse WhatsApp message to our format
-   */
-  private parseMessage(msg: proto.IWebMessageInfo): WhatsAppMessage | null {
-    try {
-      const messageType = this.getMessageType(msg.message || undefined);
-      const content = this.extractMessageContent(msg.message || undefined);
-      
-      if (!content) return null;
-
-      const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
-      const groupId = isGroup ? msg.key.remoteJid : undefined;
-
-      return {
-        id: msg.key.id || '',
-        from: msg.key.participant || msg.key.remoteJid || '',
-        to: msg.key.remoteJid || '',
-        timestamp: msg.messageTimestamp ? (msg.messageTimestamp as number) * 1000 : Date.now(),
-        type: messageType,
-        content,
-        isGroup,
-        groupId: groupId || undefined,
-        senderName: msg.pushName || undefined,
-      };
-    } catch (error) {
-      logger.error('Error parsing message', { error: error instanceof Error ? error.message : 'Unknown error' });
-      return null;
-    }
-  }
-
-  /**
-   * Extract message content based on type
-   */
-  private extractMessageContent(message: proto.IMessage | undefined): string | null {
-    if (!message) return null;
-
-    if (message.conversation) return message.conversation;
-    if (message.extendedTextMessage?.text) return message.extendedTextMessage.text;
-    if (message.imageMessage?.caption) return message.imageMessage.caption;
-    if (message.videoMessage?.caption) return message.videoMessage.caption;
-    if (message.documentMessage?.title) return message.documentMessage.title;
-
-    return null;
-  }
-
-  /**
-   * Get message type
-   */
-  private getMessageType(message: proto.IMessage | undefined): WhatsAppMessage['type'] {
-    if (!message) return 'text';
-
-    if (message.conversation || message.extendedTextMessage) return 'text';
-    if (message.imageMessage) return 'image';
-    if (message.videoMessage) return 'video';
-    if (message.audioMessage) return 'audio';
-    if (message.documentMessage) return 'document';
-    if (message.locationMessage) return 'location';
-    if (message.contactMessage) return 'contact';
-
-    return 'text';
-  }
-
-  /**
-   * Add message handler
-   */
-  onMessage(handler: (message: WhatsAppMessage) => void): void {
-    this.messageHandlers.push(handler);
-  }
-
-  /**
-   * Add connection status handler
-   */
-  onConnectionStatusChange(handler: (status: ConnectionStatus) => void): void {
-    this.statusHandlers.push(handler);
-  }
-
-  /**
-   * Update connection status and notify handlers
-   */
-  private updateConnectionStatus(status: ConnectionStatus): void {
-    this.connectionStatus = status;
-    logger.info('Connection status changed', { status });
-    
-    this.statusHandlers.forEach(handler => {
-      try {
-        handler(status);
-      } catch (error) {
-        logger.error('Error in status handler', { error: error instanceof Error ? error.message : 'Unknown error' });
+      if (!this.isConnected) {
+        throw new Error('WhatsApp client is not connected');
       }
-    });
-  }
-
-  /**
-   * Get current connection status
-   */
-  getConnectionStatus(): ConnectionStatus {
-    return this.connectionStatus;
-  }
-
-  /**
-   * Check if WhatsApp is connected
-   */
-  isConnected(): boolean {
-    return this.connectionStatus === ConnectionStatus.READY;
-  }
-
-  /**
-   * Disconnect WhatsApp
-   */
-  async disconnect(): Promise<void> {
-    if (this.sock) {
-      await this.sock.logout();
-      this.sock = null;
-    }
-    this.updateConnectionStatus(ConnectionStatus.DISCONNECTED);
-    logger.info('WhatsApp disconnected');
-  }
-
-  /**
-   * Get chat participants (for group chats)
-   */
-  async getChatParticipants(chatId: string): Promise<string[]> {
-    if (!this.sock || !chatId.endsWith('@g.us')) {
-      return [];
-    }
-
-    try {
-      const groupMetadata = await this.sock.groupMetadata(chatId);
-      return groupMetadata.participants.map(p => p.id);
+      await this.client.sendMessage(chatId, message);
+      logger.info('Message sent', { chatId, message: message.substring(0, 50) });
     } catch (error) {
-      logger.error('Failed to get chat participants', { chatId, error: error instanceof Error ? error.message : 'Unknown error' });
-      return [];
+      logger.error('Failed to send message', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+      throw error;
     }
   }
-} 
+
+  /**
+   * Get the hardcoded WhatsApp number
+   */
+  getWhatsAppNumber(): string {
+    return whatsappConfig.whatsappNumber;
+  }
+
+  /**
+   * Check if connected
+   */
+  isWhatsAppConnected(): boolean {
+    return this.isConnected;
+  }
+
+  /**
+   * Shutdown WhatsApp service
+   */
+  async shutdown(): Promise<void> {
+    try {
+      await this.client.destroy();
+      logger.info('WhatsApp service shutdown completed');
+    } catch (error) {
+      logger.error('Error during WhatsApp shutdown', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+}
